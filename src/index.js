@@ -61,6 +61,23 @@ class Metrics {
   }
 }
 
+const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const RETRYABLE_METHODS = new Set(['GET', 'HEAD']);
+const DOCKER_HUB_REGISTRY_HOSTNAMES = new Set(['registry-1.docker.io', 'registry.docker.io']);
+
+function parseNonNegativeInt(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function getRetryBackoffMs(attempt) {
+  return Math.min(2000, 200 * (2 ** attempt));
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // 配置验证
 function validateConfig(env, logger = null) {
   const requiredConfigs = ['PROXY_HOSTNAME'];
@@ -111,7 +128,7 @@ function validateConfig(env, logger = null) {
 }
 
 // 简化创建新请求的函数
-function createNewRequest(request, url, proxyHostname, originHostname) {
+function createNewRequest(request, url, proxyHostname, originHostname, signal = null) {
   const newRequestHeaders = new Headers(request.headers);
   for (const [key, value] of newRequestHeaders) {
     if (value.includes(originHostname)) {
@@ -127,13 +144,85 @@ function createNewRequest(request, url, proxyHostname, originHostname) {
   
   // 移除SHA256验证，因为Docker Registry的blob请求格式是有效的
   const finalUrl = url.toString();
-  
-  return new Request(finalUrl, {
+
+  const requestInit = {
     method: request.method,
     headers: newRequestHeaders,
     body: request.body,
     redirect: 'follow'
-  });
+  };
+
+  if (signal) {
+    requestInit.signal = signal;
+  }
+
+  return new Request(finalUrl, requestInit);
+}
+
+async function fetchWithRetry(requestFactory, options) {
+  const {
+    timeoutMs,
+    maxRetries,
+    requestMethod,
+    logger,
+    targetUrl
+  } = options;
+  const retryBudget = RETRYABLE_METHODS.has(requestMethod.toUpperCase())
+    ? Math.max(0, maxRetries)
+    : 0;
+
+  let lastError;
+
+  for (let attempt = 0; attempt <= retryBudget; attempt++) {
+    const timeoutController = new AbortController();
+    const timeoutId = setTimeout(() => {
+      timeoutController.abort('REQUEST_TIMEOUT');
+    }, timeoutMs);
+
+    try {
+      const response = await fetch(requestFactory(timeoutController.signal));
+      clearTimeout(timeoutId);
+
+      const canRetry = attempt < retryBudget;
+      if (canRetry && RETRYABLE_STATUS_CODES.has(response.status)) {
+        metrics.recordRetry();
+        logger.debug('upstream_retry', {
+          targetUrl,
+          status: response.status,
+          attempt: attempt + 1,
+          maxRetries: retryBudget
+        });
+        await sleep(getRetryBackoffMs(attempt));
+        continue;
+      }
+
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      lastError = error;
+
+      if (error?.name === 'AbortError') {
+        metrics.recordTimeout();
+      }
+
+      const canRetry = attempt < retryBudget;
+      if (!canRetry) {
+        throw error;
+      }
+
+      metrics.recordRetry();
+      logger.debug('upstream_retry', {
+        targetUrl,
+        reason: error?.name === 'AbortError' ? 'timeout' : 'network_error',
+        error: error?.message || 'unknown_error',
+        attempt: attempt + 1,
+        maxRetries: retryBudget
+      });
+      await sleep(getRetryBackoffMs(attempt));
+    }
+  }
+
+  throw lastError || new ProxyError('Upstream request failed', 502, 'UPSTREAM_ERROR');
 }
 
 
@@ -228,6 +317,8 @@ const metrics = new Metrics();
 // 简化主处理函数
 export default {
   async fetch(request, env, ctx) {
+    const logger = new WorkerLogger();
+
     try {
       let {
         PROXY_HOSTNAME = "registry-1.docker.io",
@@ -241,13 +332,13 @@ export default {
         REGION_WHITELIST_REGEX,
         REGION_BLACKLIST_REGEX,
         DEBUG = false,
+        REQUEST_TIMEOUT = 120000,
+        MAX_RETRIES = 0
       } = env;
 
       const url = new URL(request.url);
       const originHostname = url.hostname;
-      
-      // 初始化日志器
-      const logger = new WorkerLogger();
+
       logger.requestStart(request);
       
       // 记录指标开始
@@ -269,11 +360,17 @@ export default {
       // 根据路径调整代理主机名
       const originalProxyHostname = PROXY_HOSTNAME;
       let routingReason = "default";
-      
-      if (url.pathname.includes("/token")) {
+
+      if (
+        url.pathname.includes("/token") &&
+        DOCKER_HUB_REGISTRY_HOSTNAMES.has(originalProxyHostname)
+      ) {
         PROXY_HOSTNAME = "auth.docker.io";
         routingReason = "token_endpoint";
-      } else if (url.pathname.includes("/search")) {
+      } else if (
+        url.pathname.includes("/search") &&
+        DOCKER_HUB_REGISTRY_HOSTNAMES.has(originalProxyHostname)
+      ) {
         PROXY_HOSTNAME = "index.docker.io";
         routingReason = "search_endpoint";
       }
@@ -340,11 +437,21 @@ export default {
 
       const targetUrl = url.toString();
       logger.proxyForward(targetUrl, PROXY_HOSTNAME);
-      
-      const newRequest = createNewRequest(request, url, PROXY_HOSTNAME, originHostname);
+
+      const timeoutMs = Math.max(1, parseNonNegativeInt(REQUEST_TIMEOUT, 120000));
+      const maxRetries = parseNonNegativeInt(MAX_RETRIES, 0);
       const proxyStart = Date.now();
-      
-      const originalResponse = await fetch(newRequest);
+
+      const originalResponse = await fetchWithRetry(
+        (signal) => createNewRequest(request, url, PROXY_HOSTNAME, originHostname, signal),
+        {
+          timeoutMs,
+          maxRetries,
+          requestMethod: request.method,
+          logger,
+          targetUrl
+        }
+      );
       const proxyDuration = Date.now() - proxyStart;
       
       logger.proxyResponse(originalResponse, proxyDuration);

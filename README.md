@@ -16,7 +16,7 @@
 ### 性能优化
 - 基于 Cloudflare CDN
 - 智能的缓存策略
-- 连接超时优化
+- 上游请求超时控制与重试退避
 - 响应内容处理
 
 ### 安全特性
@@ -37,6 +37,8 @@
 |-------|-----|--------|------|
 | PROXY_HOSTNAME | 是 | registry-1.docker.io | 代理地址 hostname |
 | PROXY_PROTOCOL | 否 | https | 代理协议 |
+| REQUEST_TIMEOUT | 否 | 120000 | 上游请求超时（毫秒） |
+| MAX_RETRIES | 否 | 0 | 失败重试次数（仅 GET/HEAD，含 429/5xx/超时） |
 | PATHNAME_REGEX | 否 | - | 路径过滤正则 |
 | UA_WHITELIST_REGEX | 否 | - | UA白名单正则 |
 | UA_BLACKLIST_REGEX | 否 | - | UA黑名单正则 |
@@ -64,6 +66,8 @@
 
 ## Docker 配置示例
 
+> 根据 Docker 官方文档，`registry-mirrors` 仅适用于 Docker Hub（`docker.io`）。
+
 1. 设置镜像加速
 ```bash
 # 将 dockerhub.xxx.com 替换为你的 Workers 域名
@@ -77,9 +81,22 @@ systemctl daemon-reload
 systemctl restart docker
 ```
 
-2. 查询镜像
+2. 构建场景（BuildKit）镜像加速
+```toml
+# /etc/buildkitd.toml
+[registry."docker.io"]
+  mirrors = ["https://dockerhub.xxx.com"]
+```
+
+3. 查询镜像
 ```bash
-docker search dockerhub.xxx.com/image_name
+docker search nginx
+```
+
+4. 其他镜像仓库（如 GHCR/Quay）建议直接使用代理域名拉取
+```bash
+# 例如代理 ghcr.io 时
+docker pull dockerhub.xxx.com/OWNER/IMAGE:TAG
 ```
 
 ## 监控与日志
@@ -101,6 +118,7 @@ docker search dockerhub.xxx.com/image_name
 2. 设置 Workers 自定义域名
 3. 避免代理整个站点以防风控
 4. 定期检查访问日志和性能指标
+5. 如出现 Docker Hub 429 限流，优先使用已认证账号拉取，并保留重试退避策略
 
 ## 许可证
 
