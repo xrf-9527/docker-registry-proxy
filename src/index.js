@@ -63,6 +63,8 @@ class Metrics {
 
 const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
 const RETRYABLE_METHODS = new Set(['GET', 'HEAD']);
+const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
+const MAX_REDIRECT_HOPS = 5;
 const DOCKER_HUB_REGISTRY_HOSTNAMES = new Set(['registry-1.docker.io', 'registry.docker.io']);
 
 function parseNonNegativeInt(value, fallback) {
@@ -148,15 +150,40 @@ function createNewRequest(request, url, proxyHostname, originHostname, signal = 
   const requestInit = {
     method: request.method,
     headers: newRequestHeaders,
-    body: request.body,
-    redirect: 'follow'
+    redirect: 'manual'
   };
+
+  if (!['GET', 'HEAD'].includes(request.method.toUpperCase())) {
+    requestInit.body = request.body;
+  }
 
   if (signal) {
     requestInit.signal = signal;
   }
 
   return new Request(finalUrl, requestInit);
+}
+
+function createRedirectRequest(request, redirectUrl, signal = null) {
+  const currentUrl = new URL(request.url);
+  const nextHeaders = new Headers(request.headers);
+
+  if (redirectUrl.hostname !== currentUrl.hostname) {
+    nextHeaders.delete('authorization');
+    nextHeaders.delete('host');
+  }
+
+  const requestInit = {
+    method: request.method,
+    headers: nextHeaders,
+    redirect: 'manual'
+  };
+
+  if (signal) {
+    requestInit.signal = signal;
+  }
+
+  return new Request(redirectUrl.toString(), requestInit);
 }
 
 async function fetchWithRetry(requestFactory, options) {
@@ -180,7 +207,27 @@ async function fetchWithRetry(requestFactory, options) {
     }, timeoutMs);
 
     try {
-      const response = await fetch(requestFactory(timeoutController.signal));
+      const request = requestFactory(timeoutController.signal);
+      let response = await fetch(request);
+      let lastRequest = request;
+      let redirectHops = 0;
+
+      while (
+        RETRYABLE_METHODS.has(lastRequest.method.toUpperCase()) &&
+        REDIRECT_STATUS_CODES.has(response.status) &&
+        redirectHops < MAX_REDIRECT_HOPS
+      ) {
+        const location = response.headers.get('location');
+        if (!location) {
+          break;
+        }
+
+        const redirectUrl = new URL(location, lastRequest.url);
+        lastRequest = createRedirectRequest(lastRequest, redirectUrl, timeoutController.signal);
+        response = await fetch(lastRequest);
+        redirectHops += 1;
+      }
+
       clearTimeout(timeoutId);
 
       const canRetry = attempt < retryBudget;

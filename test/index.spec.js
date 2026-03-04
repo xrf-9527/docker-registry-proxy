@@ -95,4 +95,45 @@ describe('Docker registry proxy worker', () => {
     expect(response.status).toBe(200);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it('follows blob redirects and strips authorization on cross-host hop', async () => {
+    const blobDigest = 'sha256:76eb174b37c3e263a212412822299b58d4098a7f96715f18c7eb6932c98b7efd';
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 307,
+          headers: { location: 'https://storage.example/blobs/content?signature=abc123' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response('blob-data', {
+          status: 200,
+          headers: { 'content-type': 'application/octet-stream' },
+        }),
+      );
+    globalThis.fetch = fetchMock;
+    const request = new Request(`https://proxy.example/v2/library/alpine/blobs/${blobDigest}`, {
+      headers: {
+        authorization: 'Bearer test-token',
+        range: 'bytes=0-1023',
+      },
+    });
+    const ctx = createExecutionContext();
+
+    const response = await worker.fetch(request, createEnv(), ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const firstHopRequest = fetchMock.mock.calls[0][0];
+    expect(new URL(firstHopRequest.url).hostname).toBe('registry-1.docker.io');
+    expect(firstHopRequest.headers.get('authorization')).toBe('Bearer test-token');
+
+    const secondHopRequest = fetchMock.mock.calls[1][0];
+    expect(new URL(secondHopRequest.url).hostname).toBe('storage.example');
+    expect(secondHopRequest.headers.get('authorization')).toBeNull();
+    expect(secondHopRequest.headers.get('range')).toBe('bytes=0-1023');
+  });
 });
