@@ -1,0 +1,23 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "docker-registry-proxy",
+	"main": "src/index.js",
+	"workers_dev": true,
+	"preview_urls": true,
+	"routes": [{ "pattern": "docker.950288.xyz", "custom_domain": true }],
+	"compatibility_date": "2026-09-11",
+	"observability": { "enabled": true },
+	"vars": {
+		"PROXY_HOSTNAME": "registry-1.docker.io",
+		"PROXY_PROTOCOL": "https",
+		"DEBUG": false,
+		"REQUEST_TIMEOUT": 120000,
+		"STREAM_IDLE_TIMEOUT": 120000,
+		"MAX_RETRIES": 2,
+		// Optional access filters (include /token when restricting Docker Hub paths):
+		// "PATHNAME_REGEX": "^/(v2/|token$)",
+		// "UA_WHITELIST_REGEX": "docker|buildkit|containerd",
+		// "IP_WHITELIST_REGEX": "^203\\.0\\.113\\.10$",
+		// "REGION_WHITELIST_REGEX": "^(TW|JP)$"
+	},
+}

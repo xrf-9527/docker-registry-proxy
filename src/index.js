@@ -1,550 +1,367 @@
 import { WorkerLogger } from './logger.js';
 
-// 错误处理
+const RETRYABLE = new Set([408, 429, 500, 502, 503, 504]);
+const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+const READ_METHODS = new Set(['GET', 'HEAD']);
+const HOP_HEADERS = [
+	'connection',
+	'keep-alive',
+	'proxy-authenticate',
+	'proxy-authorization',
+	'proxy-connection',
+	'te',
+	'trailer',
+	'transfer-encoding',
+	'upgrade',
+];
+
 class ProxyError extends Error {
-  constructor(message, statusCode, errorType) {
-    super(message);
-    this.name = 'ProxyError';
-    this.statusCode = statusCode;
-    this.errorType = errorType;
-  }
+	constructor(message, status = 502) {
+		super(message);
+		this.status = status;
+	}
 }
 
-// 指标收集
-class Metrics {
-  constructor() {
-    this.requests = 0;
-    this.errors = 0;
-    this.timeouts = 0;
-    this.bytesTransferred = 0;
-    this.requestTimings = new Map();
-    this.retries = 0;
-  }
-
-  recordRequestStart(requestId) {
-    this.requests++;
-    this.requestTimings.set(requestId, Date.now());
-  }
-
-  recordRequestEnd(requestId, bytes = 0) {
-    const startTime = this.requestTimings.get(requestId);
-    const duration = startTime ? Date.now() - startTime : 0;
-    this.bytesTransferred += bytes;
-    this.requestTimings.delete(requestId);
-    return duration;
-  }
-
-  recordError() {
-    this.errors++;
-  }
-
-  recordTimeout() {
-    this.timeouts++;
-  }
-
-  recordRetry() {
-    this.retries++;
-  }
-
-  getMetrics() {
-    return {
-      requests: this.requests,
-      errors: this.errors,
-      timeouts: this.timeouts,
-      retries: this.retries,
-      bytesTransferred: this.bytesTransferred,
-      errorRate: (this.errors / this.requests) || 0,
-      timeoutRate: (this.timeouts / this.requests) || 0,
-      retryRate: (this.retries / this.requests) || 0,
-      timestamp: new Date().toISOString()
-    };
-  }
+function integer(value, fallback, max) {
+	const number = value === undefined ? fallback : Number(value);
+	if (!Number.isSafeInteger(number) || number < 1 || number > max) throw new ProxyError('Invalid timeout configuration', 500);
+	return number;
 }
 
-const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
-const RETRYABLE_METHODS = new Set(['GET', 'HEAD']);
-const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
-const MAX_REDIRECT_HOPS = 5;
-const DOCKER_HUB_REGISTRY_HOSTNAMES = new Set(['registry-1.docker.io', 'registry.docker.io']);
-
-function parseNonNegativeInt(value, fallback) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+function configuration(env) {
+	const hostname = env.PROXY_HOSTNAME || 'registry-1.docker.io';
+	const protocol = env.PROXY_PROTOCOL || 'https';
+	let upstream;
+	try {
+		upstream = new URL(`${protocol}://${hostname}`);
+	} catch {
+		throw new ProxyError('Invalid upstream configuration', 500);
+	}
+	if (
+		!['https:', 'http:'].includes(upstream.protocol) ||
+		upstream.username ||
+		upstream.password ||
+		upstream.pathname !== '/' ||
+		upstream.search ||
+		upstream.hash
+	) {
+		throw new ProxyError('Invalid upstream configuration', 500);
+	}
+	// The legacy alias no longer serves the Registry API.
+	if (upstream.hostname === 'registry.docker.io') upstream.hostname = 'registry-1.docker.io';
+	const maxRetries = env.MAX_RETRIES === undefined ? 2 : Number(env.MAX_RETRIES);
+	if (!Number.isInteger(maxRetries) || maxRetries < 0 || maxRetries > 5) throw new ProxyError('MAX_RETRIES must be between 0 and 5', 500);
+	const filters = {};
+	for (const key of [
+		'PATHNAME_REGEX',
+		'UA_WHITELIST_REGEX',
+		'UA_BLACKLIST_REGEX',
+		'IP_WHITELIST_REGEX',
+		'IP_BLACKLIST_REGEX',
+		'REGION_WHITELIST_REGEX',
+		'REGION_BLACKLIST_REGEX',
+	]) {
+		if (env[key]) {
+			try {
+				filters[key] = new RegExp(env[key]);
+			} catch {
+				throw new ProxyError(`Invalid ${key}`, 500);
+			}
+		}
+	}
+	return {
+		upstream,
+		filters,
+		maxRetries,
+		timeout: integer(env.REQUEST_TIMEOUT, 120000, 300000),
+		idleTimeout: integer(env.STREAM_IDLE_TIMEOUT, 120000, 300000),
+	};
 }
 
-function getRetryBackoffMs(attempt) {
-  return Math.min(2000, 200 * (2 ** attempt));
+function allowed(request, url, filters) {
+	if (filters.PATHNAME_REGEX && !filters.PATHNAME_REGEX.test(url.pathname)) return false;
+	const attributes = {
+		UA: request.headers.get('user-agent')?.toLowerCase(),
+		IP: request.headers.get('cf-connecting-ip'),
+		REGION: request.cf?.country || request.headers.get('cf-ipcountry'),
+	};
+	for (const [prefix, value] of Object.entries(attributes)) {
+		const whitelist = filters[`${prefix}_WHITELIST_REGEX`];
+		const blacklist = filters[`${prefix}_BLACKLIST_REGEX`];
+		// A configured filter must not silently allow missing identity metadata.
+		if ((whitelist || blacklist) && !value) return false;
+		if (whitelist && !whitelist.test(value)) return false;
+		if (blacklist?.test(value)) return false;
+	}
+	return true;
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function cleanHeaders(source) {
+	const headers = new Headers(source);
+	const connectionHeaders = headers.get('connection')?.split(',') || [];
+	for (const key of [...HOP_HEADERS, ...connectionHeaders]) {
+		if (key.trim()) headers.delete(key.trim());
+	}
+	return headers;
 }
 
-// 配置验证
-function validateConfig(env, logger = null) {
-  const requiredConfigs = ['PROXY_HOSTNAME'];
-  const missingConfigs = requiredConfigs.filter(key => !env[key]);
-
-  if (missingConfigs.length > 0) {
-    const error = new ProxyError(
-      `Missing required configurations: ${missingConfigs.join(', ')}`,
-      500,
-      'CONFIG_ERROR'
-    );
-    if (logger) logger.configError(error);
-    throw error;
-  }
-
-  const regexConfigs = [
-    'PATHNAME_REGEX',
-    'UA_WHITELIST_REGEX',
-    'UA_BLACKLIST_REGEX',
-    'IP_WHITELIST_REGEX',
-    'IP_BLACKLIST_REGEX',
-    'REGION_WHITELIST_REGEX',
-    'REGION_BLACKLIST_REGEX'
-  ];
-
-  for (const config of regexConfigs) {
-    if (env[config]) {
-      try {
-        new RegExp(env[config]);
-        if (logger) {
-          logger.debug('config_validation', { 
-            config, 
-            status: 'valid',
-            pattern: env[config] 
-          });
-        }
-      } catch (e) {
-        const error = new ProxyError(
-          `Invalid regex in ${config}: ${e.message}`,
-          500,
-          'CONFIG_ERROR'
-        );
-        if (logger) logger.configError(error);
-        throw error;
-      }
-    }
-  }
+function upstreamHeaders(request) {
+	const headers = cleanHeaders(request.headers);
+	for (const key of [...headers.keys()]) {
+		if (
+			key === 'host' ||
+			key === 'cookie' ||
+			key === 'forwarded' ||
+			key === 'referer' ||
+			key.startsWith('cf-') ||
+			key.startsWith('x-forwarded-')
+		)
+			headers.delete(key);
+	}
+	return headers;
 }
 
-// 简化创建新请求的函数
-function createNewRequest(request, url, proxyHostname, originHostname, signal = null) {
-  const newRequestHeaders = new Headers(request.headers);
-  for (const [key, value] of newRequestHeaders) {
-    if (value.includes(originHostname)) {
-      newRequestHeaders.set(
-        key,
-        value.replace(
-          new RegExp(`(?<!\\.)\\b${originHostname}\\b`, "g"),
-          proxyHostname
-        )
-      );
-    }
-  }
-  
-  // 移除SHA256验证，因为Docker Registry的blob请求格式是有效的
-  const finalUrl = url.toString();
-
-  const requestInit = {
-    method: request.method,
-    headers: newRequestHeaders,
-    redirect: 'manual'
-  };
-
-  if (!['GET', 'HEAD'].includes(request.method.toUpperCase())) {
-    requestInit.body = request.body;
-  }
-
-  if (signal) {
-    requestInit.signal = signal;
-  }
-
-  return new Request(finalUrl, requestInit);
+function responseHeaders(response, upstream, publicUrl, hub) {
+	const headers = cleanHeaders(response.headers);
+	const rewrite = (value, auth = false) => {
+		let url;
+		try {
+			url = new URL(value);
+		} catch {
+			return value;
+		}
+		const hubAuth = auth && hub && url.origin === 'https://auth.docker.io' && url.pathname === '/token';
+		if (url.origin !== upstream.origin && !hubAuth) return value;
+		url.protocol = publicUrl.protocol;
+		url.host = publicUrl.host;
+		return url.toString();
+	};
+	const challenge = headers.get('www-authenticate');
+	if (challenge)
+		headers.set(
+			'www-authenticate',
+			challenge.replace(/(\brealm\s*=\s*")([^"]+)(")/gi, (_, start, realm, end) => start + rewrite(realm, true) + end),
+		);
+	const location = headers.get('location');
+	if (location) headers.set('location', rewrite(location));
+	const link = headers.get('link');
+	if (link)
+		headers.set(
+			'link',
+			link.replace(/<([^>]+)>/g, (_, url) => `<${rewrite(url)}>`),
+		);
+	// This is a forwarding proxy, not a shared cache for authenticated images.
+	headers.set('cache-control', 'no-store');
+	return headers;
 }
 
-function createRedirectRequest(request, redirectUrl, signal = null) {
-  const currentUrl = new URL(request.url);
-  const nextHeaders = new Headers(request.headers);
-
-  if (redirectUrl.hostname !== currentUrl.hostname) {
-    nextHeaders.delete('authorization');
-    nextHeaders.delete('host');
-  }
-
-  const requestInit = {
-    method: request.method,
-    headers: nextHeaders,
-    redirect: 'manual'
-  };
-
-  if (signal) {
-    requestInit.signal = signal;
-  }
-
-  return new Request(redirectUrl.toString(), requestInit);
+function retryDelay(response, attempt) {
+	const value = response?.headers.get('retry-after');
+	if (value !== null && value !== undefined) {
+		if (/^\d+$/.test(value.trim())) return Number(value) * 1000;
+		const date = Date.parse(value);
+		if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+	}
+	return Math.min(2000, 200 * 2 ** attempt) + Math.floor(Math.random() * 200);
 }
 
-async function fetchWithRetry(requestFactory, options) {
-  const {
-    timeoutMs,
-    maxRetries,
-    requestMethod,
-    logger,
-    targetUrl
-  } = options;
-  const retryBudget = RETRYABLE_METHODS.has(requestMethod.toUpperCase())
-    ? Math.max(0, maxRetries)
-    : 0;
-
-  let lastError;
-
-  for (let attempt = 0; attempt <= retryBudget; attempt++) {
-    const timeoutController = new AbortController();
-    const timeoutId = setTimeout(() => {
-      timeoutController.abort('REQUEST_TIMEOUT');
-    }, timeoutMs);
-
-    try {
-      const request = requestFactory(timeoutController.signal);
-      let response = await fetch(request);
-      let lastRequest = request;
-      let redirectHops = 0;
-
-      while (
-        RETRYABLE_METHODS.has(lastRequest.method.toUpperCase()) &&
-        REDIRECT_STATUS_CODES.has(response.status) &&
-        redirectHops < MAX_REDIRECT_HOPS
-      ) {
-        const location = response.headers.get('location');
-        if (!location) {
-          break;
-        }
-
-        const redirectUrl = new URL(location, lastRequest.url);
-        lastRequest = createRedirectRequest(lastRequest, redirectUrl, timeoutController.signal);
-        response = await fetch(lastRequest);
-        redirectHops += 1;
-      }
-
-      clearTimeout(timeoutId);
-
-      const canRetry = attempt < retryBudget;
-      if (canRetry && RETRYABLE_STATUS_CODES.has(response.status)) {
-        metrics.recordRetry();
-        logger.debug('upstream_retry', {
-          targetUrl,
-          status: response.status,
-          attempt: attempt + 1,
-          maxRetries: retryBudget
-        });
-        await sleep(getRetryBackoffMs(attempt));
-        continue;
-      }
-
-      return response;
-    } catch (error) {
-      clearTimeout(timeoutId);
-      lastError = error;
-
-      if (error?.name === 'AbortError') {
-        metrics.recordTimeout();
-      }
-
-      const canRetry = attempt < retryBudget;
-      if (!canRetry) {
-        throw error;
-      }
-
-      metrics.recordRetry();
-      logger.debug('upstream_retry', {
-        targetUrl,
-        reason: error?.name === 'AbortError' ? 'timeout' : 'network_error',
-        error: error?.message || 'unknown_error',
-        attempt: attempt + 1,
-        maxRetries: retryBudget
-      });
-      await sleep(getRetryBackoffMs(attempt));
-    }
-  }
-
-  throw lastError || new ProxyError('Upstream request failed', 502, 'UPSTREAM_ERROR');
+function sleep(ms, signal) {
+	return new Promise((resolve, reject) => {
+		if (signal.aborted) return reject(signal.reason);
+		const abort = () => {
+			clearTimeout(timer);
+			reject(signal.reason);
+		};
+		const timer = setTimeout(() => {
+			signal.removeEventListener('abort', abort);
+			resolve();
+		}, ms);
+		signal.addEventListener('abort', abort, { once: true });
+	});
 }
 
-
-// 简化响应头处理函数
-function setResponseHeaders(
-  originalResponse,
-  proxyHostname,
-  originHostname,
-  DEBUG
-) {
-  const newResponseHeaders = new Headers(originalResponse.headers);
-  for (const [key, value] of newResponseHeaders) {
-    if (value.includes(proxyHostname)) {
-      newResponseHeaders.set(
-        key,
-        value.replace(
-          new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
-          originHostname
-        )
-      );
-    }
-  }
-  
-  if (DEBUG) {
-    newResponseHeaders.delete("content-security-policy");
-  }
-  
-  // 简化 Docker 认证 URL 处理
-  let docker_auth_url = newResponseHeaders.get("www-authenticate");
-  if (docker_auth_url && docker_auth_url.includes("auth.docker.io/token")) {
-    newResponseHeaders.set(
-      "www-authenticate",
-      docker_auth_url.replace("auth.docker.io/token", originHostname + "/token")
-    );
-  }
-  
-  return newResponseHeaders;
+async function discard(response) {
+	if (response?.body) await response.body.cancel();
 }
 
-// 简化响应内容处理函数
-async function replaceResponseText(
-  originalResponse,
-  proxyHostname,
-  pathnameRegex,
-  originHostname
-) {
-  let text = await originalResponse.text();
-  if (pathnameRegex) {
-    pathnameRegex = pathnameRegex.replace(/^\^/, "");
-    return text.replace(
-      new RegExp(`((?<!\\.)\\b${proxyHostname}\\b)(${pathnameRegex})`, "g"),
-      `${originHostname}$2`
-    );
-  } else {
-    return text.replace(
-      new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
-      originHostname
-    );
-  }
+async function fetchUpstream(request, target, config, logger) {
+	const headers = upstreamHeaders(request);
+	const controller = new AbortController();
+	const signal = AbortSignal.any([request.signal, controller.signal]);
+	const deadline = Date.now() + config.timeout;
+	const timer = setTimeout(() => controller.abort(new ProxyError('Upstream response timeout', 504)), config.timeout);
+	const canRetry = READ_METHODS.has(request.method);
+	try {
+		for (let attempt = 0; ; attempt++) {
+			let response;
+			try {
+				let url = new URL(target);
+				const hopHeaders = new Headers(headers);
+				for (let hops = 0; ; hops++) {
+					signal.throwIfAborted();
+					response = await fetch(
+						new Request(url, {
+							method: request.method,
+							headers: hopHeaders,
+							redirect: 'manual',
+							cache: 'no-store',
+							signal,
+							body: canRetry ? undefined : request.body,
+						}),
+					);
+					if (!canRetry || !REDIRECTS.has(response.status)) break;
+					const location = response.headers.get('location');
+					if (!location) break;
+					await discard(response);
+					response = undefined;
+					if (hops >= 5) throw new ProxyError('Too many upstream redirects');
+					let next;
+					try {
+						next = new URL(location, url);
+					} catch {
+						throw new ProxyError('Invalid upstream redirect');
+					}
+					if (
+						!['http:', 'https:'].includes(next.protocol) ||
+						next.username ||
+						next.password ||
+						(url.protocol === 'https:' && next.protocol !== 'https:')
+					)
+						throw new ProxyError('Unsafe upstream redirect');
+					if (next.origin !== url.origin) hopHeaders.delete('authorization');
+					url = next;
+				}
+			} catch (error) {
+				if (signal.aborted) throw signal.reason;
+				if (error instanceof ProxyError || !canRetry || attempt >= config.maxRetries) throw error;
+			}
+			if (response && (!canRetry || !RETRYABLE.has(response.status) || attempt >= config.maxRetries)) return response;
+			const delay = retryDelay(response, attempt);
+			// A long Retry-After is returned to the caller, never shortened to fit our budget.
+			if (Date.now() + delay >= deadline) {
+				if (response) return response;
+				throw new ProxyError('Upstream response timeout', 504);
+			}
+			await discard(response);
+			logger.debug('upstream_retry', { attempt: attempt + 1, delayMs: delay });
+			await sleep(delay, signal);
+		}
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
-// Nginx 默认页面
-async function nginx() {
-  return `<!DOCTYPE html>
-<html>
-<head>
-<title>Welcome to nginx!</title>
-<style>
-html { color-scheme: light dark; }
-body { width: 35em; margin: 0 auto;
-font-family: Tahoma, Verdana, Arial, sans-serif; }
-</style>
-</head>
-<body>
-<h1>Welcome to nginx!</h1>
-<p>If you see this page, the nginx web server is successfully installed and
-working. Further configuration is required.</p>
-
-<p>For online documentation and support please refer to
-<a href="http://nginx.org/">nginx.org</a>.<br/>
-Commercial support is available at
-<a href="http://nginx.com/">nginx.com</a>.</p>
-
-<p><em>Thank you for using nginx.</em></p>
-</body>
-</html>`;
+// Read one chunk at a time. Only time out while waiting for upstream data, not
+// while downstream backpressure prevents us from reading the next chunk.
+function streamBody(body, idleTimeout, clientSignal, logger) {
+	const reader = body.getReader();
+	let timer;
+	let finished = false;
+	let bytes = 0;
+	let streamController;
+	const finish = (event) => {
+		if (finished) return false;
+		finished = true;
+		clearTimeout(timer);
+		clientSignal.removeEventListener('abort', aborted);
+		logger.log(event, { bytes });
+		return true;
+	};
+	const fail = (error, event) => {
+		if (!finish(event)) return;
+		streamController.error(error);
+		void reader.cancel(error).catch(() => {});
+	};
+	const aborted = () => fail(new ProxyError('Client disconnected', 499), 'stream_cancelled');
+	return new ReadableStream(
+		{
+			start(controller) {
+				streamController = controller;
+				clientSignal.addEventListener('abort', aborted, { once: true });
+				if (clientSignal.aborted) aborted();
+			},
+			async pull(controller) {
+				if (finished) return;
+				timer = setTimeout(() => fail(new ProxyError('Upstream stream idle timeout', 504), 'stream_timeout'), idleTimeout);
+				try {
+					const { done, value } = await reader.read();
+					clearTimeout(timer);
+					if (finished) return;
+					if (done) {
+						finish('stream_complete');
+						controller.close();
+					} else {
+						bytes += value.byteLength;
+						controller.enqueue(value);
+					}
+				} catch (error) {
+					fail(error, 'stream_error');
+				}
+			},
+			cancel(reason) {
+				finish('stream_cancelled');
+				return reader.cancel(reason);
+			},
+		},
+		{ highWaterMark: 0 },
+	);
 }
 
-// 全局指标实例
-const metrics = new Metrics();
-
-// 简化主处理函数
 export default {
-  async fetch(request, env, ctx) {
-    const logger = new WorkerLogger();
-
-    try {
-      let {
-        PROXY_HOSTNAME = "registry-1.docker.io",
-        PROXY_PROTOCOL = "https",
-        PATHNAME_REGEX,
-        UA_WHITELIST_REGEX,
-        UA_BLACKLIST_REGEX,
-        URL302,
-        IP_WHITELIST_REGEX,
-        IP_BLACKLIST_REGEX,
-        REGION_WHITELIST_REGEX,
-        REGION_BLACKLIST_REGEX,
-        DEBUG = false,
-        REQUEST_TIMEOUT = 120000,
-        MAX_RETRIES = 0
-      } = env;
-
-      const url = new URL(request.url);
-      const originHostname = url.hostname;
-
-      logger.requestStart(request);
-      
-      // 记录指标开始
-      metrics.recordRequestStart(logger.getRequestId());
-      
-      // 设置全局 DEBUG 标志
-      if (DEBUG) {
-        globalThis.DEBUG = true;
-      }
-      
-      // 验证配置
-      try {
-        validateConfig(env, logger);
-      } catch (configError) {
-        metrics.recordError();
-        return new Response("Configuration Error", { status: 500 });
-      }
-      
-      // 根据路径调整代理主机名
-      const originalProxyHostname = PROXY_HOSTNAME;
-      let routingReason = "default";
-
-      if (
-        url.pathname.includes("/token") &&
-        DOCKER_HUB_REGISTRY_HOSTNAMES.has(originalProxyHostname)
-      ) {
-        PROXY_HOSTNAME = "auth.docker.io";
-        routingReason = "token_endpoint";
-      } else if (
-        url.pathname.includes("/search") &&
-        DOCKER_HUB_REGISTRY_HOSTNAMES.has(originalProxyHostname)
-      ) {
-        PROXY_HOSTNAME = "index.docker.io";
-        routingReason = "search_endpoint";
-      }
-      
-      logger.proxyRouting(originalProxyHostname, PROXY_HOSTNAME, routingReason);
-
-      // 访问控制检查
-      if (!PROXY_HOSTNAME ||
-          (PATHNAME_REGEX && !new RegExp(PATHNAME_REGEX).test(url.pathname)) ||
-          (UA_WHITELIST_REGEX &&
-            !new RegExp(UA_WHITELIST_REGEX).test(
-              request.headers.get("user-agent")?.toLowerCase() || ''
-            )) ||
-          (UA_BLACKLIST_REGEX &&
-            new RegExp(UA_BLACKLIST_REGEX).test(
-              request.headers.get("user-agent")?.toLowerCase() || ''
-            )) ||
-          (IP_WHITELIST_REGEX &&
-            !new RegExp(IP_WHITELIST_REGEX).test(
-              request.headers.get("cf-connecting-ip")
-            )) ||
-          (IP_BLACKLIST_REGEX &&
-            new RegExp(IP_BLACKLIST_REGEX).test(
-              request.headers.get("cf-connecting-ip")
-            )) ||
-          (REGION_WHITELIST_REGEX &&
-            !new RegExp(REGION_WHITELIST_REGEX).test(
-              request.headers.get("cf-ipcountry")
-            )) ||
-          (REGION_BLACKLIST_REGEX &&
-            new RegExp(REGION_BLACKLIST_REGEX).test(
-              request.headers.get("cf-ipcountry")
-            ))
-      ) {
-        logger.accessDenied("access_control_failed", 
-          request.headers.get("cf-connecting-ip"),
-          request.headers.get("user-agent"),
-          url.pathname
-        );
-        return URL302
-          ? Response.redirect(URL302, 302)
-          : new Response(await nginx(), {
-              headers: {
-                "Content-Type": "text/html; charset=utf-8",
-              },
-            });
-      }
-
-      // 删除内部路由参数 'ns'，它不应该被发送到上游服务器
-      const hadNsParam = url.searchParams.has('ns');
-      url.searchParams.delete('ns');
-      
-      // 记录 ns 参数的删除
-      if (hadNsParam) {
-        logger.debug('removed_ns_param', {
-          originalUrl: request.url,
-          pathname: url.pathname,
-          removedParam: 'ns'
-        });
-      }
-      
-      url.host = PROXY_HOSTNAME;
-      url.protocol = PROXY_PROTOCOL;
-
-      const targetUrl = url.toString();
-      logger.proxyForward(targetUrl, PROXY_HOSTNAME);
-
-      const timeoutMs = Math.max(1, parseNonNegativeInt(REQUEST_TIMEOUT, 120000));
-      const maxRetries = parseNonNegativeInt(MAX_RETRIES, 0);
-      const proxyStart = Date.now();
-
-      const originalResponse = await fetchWithRetry(
-        (signal) => createNewRequest(request, url, PROXY_HOSTNAME, originHostname, signal),
-        {
-          timeoutMs,
-          maxRetries,
-          requestMethod: request.method,
-          logger,
-          targetUrl
-        }
-      );
-      const proxyDuration = Date.now() - proxyStart;
-      
-      logger.proxyResponse(originalResponse, proxyDuration);
-      
-      // 记录错误响应的详细信息
-      if (originalResponse.status >= 400) {
-        logger.errorResponse(originalResponse, targetUrl);
-        
-        // 特别处理blob请求错误
-        if (url.pathname.includes('/blobs/sha256:')) {
-          logger.debug('blob_request_error', {
-            originalUrl: request.url,
-            targetUrl: targetUrl,
-            sha256: url.pathname.match(/sha256:([a-f0-9]{64})/)?.[1] || 'invalid',
-            status: originalResponse.status
-          });
-        }
-      }
-      
-      const newResponseHeaders = setResponseHeaders(originalResponse, PROXY_HOSTNAME, originHostname, DEBUG);
-      
-      const contentType = newResponseHeaders.get("content-type") || "";
-      let body;
-      if (contentType.includes("text/")) {
-        body = await replaceResponseText(originalResponse, PROXY_HOSTNAME, PATHNAME_REGEX, originHostname);
-      } else {
-        body = originalResponse.body;
-      }
-
-      // 记录指标
-      const contentLength = parseInt(originalResponse.headers.get('content-length')) || 0;
-      metrics.recordRequestEnd(logger.getRequestId(), contentLength);
-      if (originalResponse.status >= 400) {
-        metrics.recordError();
-      }
-      
-      logger.requestComplete(originalResponse.status, PROXY_HOSTNAME);
-      
-      return new Response(body, {
-        status: originalResponse.status,
-        headers: newResponseHeaders,
-      });
-    } catch (error) {
-      metrics.recordError();
-      logger.requestError(error, request.url);
-      return new Response("Internal Server Error", { status: 500 });
-    }
-  },
+	async fetch(request, env) {
+		const logger = new WorkerLogger(request, env.DEBUG === true || env.DEBUG === 'true');
+		try {
+			const config = configuration(env);
+			const publicUrl = new URL(request.url);
+			if (!allowed(request, publicUrl, config.filters)) {
+				logger.log('access_denied', { status: 403 });
+				return Response.json(
+					{ errors: [{ code: 'DENIED', message: 'Access denied' }] },
+					{ status: 403, headers: { 'cache-control': 'no-store' } },
+				);
+			}
+			const hub = config.upstream.hostname === 'registry-1.docker.io';
+			const target = new URL(config.upstream);
+			target.pathname = publicUrl.pathname;
+			target.search = publicUrl.search;
+			if (target.origin === publicUrl.origin) throw new ProxyError('Proxy cannot target itself', 500);
+			if (hub && publicUrl.pathname === '/token') {
+				target.protocol = 'https:';
+				target.host = 'auth.docker.io';
+			}
+			if (target.pathname.startsWith('/v2/') && target.searchParams.has('ns')) target.searchParams.delete('ns');
+			const response = await fetchUpstream(request, target, config, logger);
+			const headers = responseHeaders(response, config.upstream, publicUrl, hub);
+			logger.log('response_headers', { status: response.status, upstream: target.host });
+			if (request.method === 'HEAD' || [204, 205, 304].includes(response.status)) {
+				await discard(response);
+				return new Response(null, { status: response.status, headers });
+			}
+			return new Response(response.body ? streamBody(response.body, config.idleTimeout, request.signal, logger) : null, {
+				status: response.status,
+				headers,
+			});
+		} catch (error) {
+			const status = request.signal.aborted ? 499 : error instanceof ProxyError ? error.status : 502;
+			logger.log('request_error', { status });
+			return Response.json(
+				{
+					errors: [
+						{
+							code: 'UNKNOWN',
+							message:
+								status === 500
+									? 'Invalid proxy configuration'
+									: status === 504
+										? 'Upstream timeout'
+										: status === 499
+											? 'Client disconnected'
+											: 'Upstream request failed',
+						},
+					],
+				},
+				{ status, headers: { 'cache-control': 'no-store' } },
+			);
+		}
+	},
 };

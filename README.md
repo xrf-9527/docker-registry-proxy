@@ -1,129 +1,123 @@
 # Docker Registry Proxy
 
-一个基于 Cloudflare Workers 的轻量级、高性能 Docker 镜像代理服务。它为 Docker Registry 提供稳定的代理访问，具有超时处理、指标收集、访问控制等功能。
+基于 Cloudflare Workers 的单上游 Registry HTTP 代理，默认转发 Docker Hub。用于代理网络访问，不实现 pull-through cache，也不会绕过上游认证或限流。
 
-> 本项目参考了 [cf-workers-proxy](https://github.com/jonssonyan/cf-workers-proxy) 的实现。
+## 工具链与开发
 
-## 功能特性
+推荐 Node.js 24 LTS（见 `.nvmrc`），最低 Node.js 22.12。使用 npm 锁文件固定依赖：
 
-### 核心功能
-- Docker Registry API v2 代理支持
-- 自动处理 Registry、Auth、Search 服务
-- 内置超时和错误处理
-- 完整的访问控制系统
-- 指标收集和监控
+- Wrangler 4：本地 workerd 运行、打包和部署。
+- `@cloudflare/vitest-plugin` + 兼容的 Vitest 4.1：在 Workers 运行时测试。
+- Prettier：统一现有代码格式。
+- `wrangler.jsonc`：运行时、绑定和部署配置的唯一来源。
 
-### 性能优化
-- 基于 Cloudflare CDN
-- 智能的缓存策略
-- 上游请求超时控制与重试退避
-- 响应内容处理
+这是没有前端构建需求的独立 Worker，按[官方选择指南](https://developers.cloudflare.com/workers/local-development/wrangler-vs-vite/)使用 `wrangler dev`。测试集成遵循[当前官方 Vitest 文档](https://developers.cloudflare.com/workers/testing/vitest-integration/write-your-first-test/)，不再使用旧 `vitest-pool-workers`。
 
-### 安全特性
-- 请求头清理和安全加固
-- IP、地区、User-Agent 访问控制
-- 详细的错误日志记录
-
-## 快速开始
-
-### 部署方式
-
-1. Workers 方式：直接复制 src/index.js 内容到 Cloudflare Workers
-2. Pages 方式：Fork 仓库，在 Cloudflare Pages 中连接 GitHub 一键部署
-
-### 环境变量配置
-
-| 变量名 | 必填 | 默认值 | 说明 |
-|-------|-----|--------|------|
-| PROXY_HOSTNAME | 是 | registry-1.docker.io | 代理地址 hostname |
-| PROXY_PROTOCOL | 否 | https | 代理协议 |
-| REQUEST_TIMEOUT | 否 | 120000 | 上游请求超时（毫秒） |
-| MAX_RETRIES | 否 | 0 | 失败重试次数（仅 GET/HEAD，含 429/5xx/超时） |
-| PATHNAME_REGEX | 否 | - | 路径过滤正则 |
-| UA_WHITELIST_REGEX | 否 | - | UA白名单正则 |
-| UA_BLACKLIST_REGEX | 否 | - | UA黑名单正则 |
-| IP_WHITELIST_REGEX | 否 | - | IP白名单正则 |
-| IP_BLACKLIST_REGEX | 否 | - | IP黑名单正则 |
-| REGION_WHITELIST_REGEX | 否 | - | 地区白名单正则 |
-| REGION_BLACKLIST_REGEX | 否 | - | 地区黑名单正则 |
-| DEBUG | 否 | false | 调试模式 |
-| URL302 | 否 | - | 访问被拒绝时跳转地址 |
-
-## 镜像仓库支持
-
-支持代理以下镜像仓库：
-
-| 镜像仓库 | 地址 |
-|---------|------|
-| Docker Hub | registry-1.docker.io |
-| k8s.gcr.io | k8s.gcr.io |
-| registry.k8s.io | registry.k8s.io |
-| Quay | quay.io |
-| GCR | gcr.io |
-| GHCR | ghcr.io |
-| Cloudsmith | docker.cloudsmith.io |
-| ECR Public | public.ecr.aws |
-
-## Docker 配置示例
-
-> 根据 Docker 官方文档，`registry-mirrors` 仅适用于 Docker Hub（`docker.io`）。
-
-1. 设置镜像加速
 ```bash
-# 将 dockerhub.xxx.com 替换为你的 Workers 域名
-mkdir -p /etc/docker
-cat > /etc/docker/daemon.json <<EOF
+npm ci
+npm run dev
+```
+
+验证与部署：
+
+```bash
+npm run check        # 格式、Workers 测试、部署 dry-run；不发布
+npm audit
+npm run smoke -- http://127.0.0.1:8787
+npx wrangler login  # 已登录时无需重复
+npm run deploy
+```
+
+`smoke` 针对 Docker Hub：匿名取 token、读取 busybox 的 linux/amd64 manifest、完整下载 config 和 layer 并校验 SHA-256，检查 HEAD 大小和 Range / 206。它访问真实上游，需要网络并消耗上游请求额度，不运行镜像、不保存 token。部署后将参数替换为 Worker 的 HTTPS 地址再次验证。
+
+GitHub Actions 在 push / PR 时执行安装、检查和依赖审计；部署仍通过已认证的 Wrangler 手动执行。不要仅复制 `src/index.js` 到控制台，它依赖本地模块。此仓库没有 Pages Functions 构建入口，使用 Workers 部署。
+
+## 代理行为
+
+- Docker Hub 的 **`/token` 精确路径**转发到 `https://auth.docker.io/token`；其他路径转发到配置的上游，不根据镜像名称中的 `token`、`search` 子串分流。
+- 原样传递 manifest / blob 字节、Accept、Range、Authorization 等协议字段。只改写需要经代理访问的认证 `realm`、同上游的绝对 Location 和 Link URL；保留 `service`、`scope`、摘要和 ETag。
+- GET / HEAD 的重定向最多跟随 5 次，跨 origin 清除 Authorization；拒绝 HTTPS 降级、非 HTTP(S) URL 和 URL 内嵌凭据。
+- GET / HEAD 遇到网络错误或 408、429、500、502、503、504 时有限重试。优先采用 Retry-After 秒数或 HTTP 日期，否则使用带抖动的指数退避；等待时间超出总预算时直接返回原响应，不提前重试。
+- 写请求原样转发，不重试、不自动跟随重定向。上传仍受 Cloudflare 账户的请求体大小限制；本项目主要验证拉取流程，不宣称完成 Registry 全套一致性认证。
+- 收到最终响应头前共用一个时间预算，包含重试、退避和重定向。之后按每次读取上游数据的空闲时间限时，尊重下游背压，不给正常进行的大镜像下载设置固定总时长上限。
+- 超过响应头预算返回 504，网络错误返回 502，配置错误返回 500，访问拒绝返回 403。已开始发送的流遇到超时会中断，无法再修改已发出的状态码；客户端可重新请求或使用 Range 恢复。
+- 每条丢弃的重定向／重试响应都会取消 body；客户端取消和下载空闲超时也会取消上游读取。
+- 子请求与返回响应显式禁用缓存，不提供镜像缓存加速承诺；这也避免对私有镜像或 token 引入共享缓存。
+
+`ns` 是可选的镜像源提示，本代理使用固定上游：只在 `/v2/` 请求中移除该参数，不根据它选择任意目标。该行为符合 [OCI Registry Proxying](https://github.com/opencontainers/distribution-spec/blob/main/spec.md#registry-proxying)。
+
+## 配置
+
+当前部署保留 `docker.950288.xyz` 自定义域名和 workers.dev 入口。Fork 自用时，先修改 Worker 名称并删除或替换 `routes` 中的域名。
+
+修改 `wrangler.jsonc` 的 `vars` 后部署。配置文件中的明文变量会覆盖控制台中的对应配置；机密应使用 `wrangler secret`，不要写入仓库。
+
+| 变量                                                | 默认值                 | 说明                                                                               |
+| --------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------- |
+| `PROXY_HOSTNAME`                                    | `registry-1.docker.io` | 单一上游主机，可含端口，不含协议、路径或凭据；旧 `registry.docker.io` 别名会规范化 |
+| `PROXY_PROTOCOL`                                    | `https`                | `https` 或 `http`；HTTP 只用于明确受信的内网上游                                   |
+| `REQUEST_TIMEOUT`                                   | `120000`               | 最终响应头前的总预算，1–300000 毫秒                                                |
+| `STREAM_IDLE_TIMEOUT`                               | `120000`               | 等待上游下一块数据的超时，1–300000 毫秒                                            |
+| `MAX_RETRIES`                                       | `2`                    | GET / HEAD 最多额外尝试次数，0–5；0 禁用重试                                       |
+| `DEBUG`                                             | `false`                | `true` 才输出重试调试日志；状态仅属于当前请求                                      |
+| `PATHNAME_REGEX`                                    | 无                     | 允许的路径正则；代理 Docker Hub 时必须同时允许 `/token`                            |
+| `UA_WHITELIST_REGEX` / `UA_BLACKLIST_REGEX`         | 无                     | 对小写 User-Agent 匹配                                                             |
+| `IP_WHITELIST_REGEX` / `IP_BLACKLIST_REGEX`         | 无                     | 对 Cloudflare 提供的客户端 IP 匹配                                                 |
+| `REGION_WHITELIST_REGEX` / `REGION_BLACKLIST_REGEX` | 无                     | 对 `request.cf.country` 匹配，缺省回退到 `CF-IPCountry`                            |
+
+黑名单优先；配置身份过滤但请求缺少该身份字段时拒绝。正则无效时返回配置错误。正则默认不自动锚定，需要精确匹配时自行使用 `^`、`$`。User-Agent 可伪造，不应单独用作身份认证。
+
+旧 `URL302` 和伪 nginx 200 页面已删除：拒绝请求现在返回明确的 Registry JSON 错误与 403。旧的 isolate 内存指标与全局 DEBUG 状态也已删除。
+
+## Docker 和 BuildKit
+
+Docker Engine 的 `registry-mirrors` 只适用于 Docker Hub，不能用于通用 GHCR／Quay 镜像源替换。[Docker 官方说明](https://docs.docker.com/docker-hub/image-library/mirror/)
+
+将以下字段合并到已有 `/etc/docker/daemon.json`，不要覆盖原配置，再按你的运行环境重启 Docker：
+
+```json
 {
-  "registry-mirrors": ["https://dockerhub.xxx.com"]
+	"registry-mirrors": ["https://your-proxy.example"]
 }
-EOF
-systemctl daemon-reload
-systemctl restart docker
 ```
 
-2. 构建场景（BuildKit）镜像加速
+```bash
+docker pull busybox:latest
+# 直接指定代理，避免客户端退回 Docker Hub 掩盖代理错误：
+docker pull your-proxy.example/library/busybox:latest
+```
+
+BuildKit 的 `buildkitd.toml`：
+
 ```toml
-# /etc/buildkitd.toml
 [registry."docker.io"]
-  mirrors = ["https://dockerhub.xxx.com"]
+  mirrors = ["your-proxy.example"]
 ```
 
-3. 查询镜像
+其他上游应使用单独的 Worker／配置，例如把 `PROXY_HOSTNAME` 改为 `ghcr.io` 后：
+
 ```bash
-docker search nginx
+docker pull your-ghcr-proxy.example/OWNER/IMAGE:TAG
 ```
 
-4. 其他镜像仓库（如 GHCR/Quay）建议直接使用代理域名拉取
-```bash
-# 例如代理 ghcr.io 时
-docker pull dockerhub.xxx.com/OWNER/IMAGE:TAG
-```
+同上游 origin 的认证 realm 可经代理访问；Docker Hub 的独立认证服务有明确映射。其他独立认证域名保持原样，需要客户端直接可达，不宣称任意 Registry 都能完全通过一个域名访问。私有镜像仍要求有效上游凭据；仅向自己信任的代理提交凭据。
 
-## 监控与日志
+`docker search` 不由 Docker Engine 的 mirror 设置代理，旧搜索转发说明已移除。上游仍可能限流，尤其是共享 Workers 出口的匿名请求；参见 [Docker Hub 429 说明](https://docs.docker.com/docker-hub/troubleshoot/)。
 
-### 指标收集
-- 请求总数和错误率
-- 超时次数和重试次数
-- 传输字节数
-- 请求处理时间
+## 日志与运维
 
-### 日志记录
-- 详细的请求/响应日志
-- 错误追踪和诊断信息
-- 性能监控数据
+启用 Workers Observability。应用日志仅记录请求 ID、方法、响应头耗时、状态、上游主机、流完成／中断事件和已读取字节数，不记录 URL 查询、Authorization、Cookie、响应头或上游异常原文。平台自动收集的 invocation 元数据由 Cloudflare 管理。
 
-## 注意事项
+`response_headers` 只表示拿到响应头；`stream_complete` 才表示应用读完上游。计数是已读取字节，不是对客户端完整收货的证明。请求量、错误率等通过 Cloudflare 的原生指标观察，不提供 `/metrics` 端点。
 
-1. 建议自用，使用正则表达式过滤请求
-2. 设置 Workers 自定义域名
-3. 避免代理整个站点以防风控
-4. 定期检查访问日志和性能指标
-5. 如出现 Docker Hub 429 限流，优先使用已认证账号拉取，并保留重试退避策略
+访问控制默认未启用。自用部署应配置合适的过滤规则；生产下载中断或限流问题需要结合实际 Workers 日志与 Docker 输出诊断。
 
-## 许可证
+## 协议与平台依据
 
-GPL-3.0 License
+- [OCI Distribution Specification](https://github.com/opencontainers/distribution-spec/blob/main/spec.md)
+- [Distribution Token Authentication](https://distribution.github.io/distribution/spec/auth/token/)
+- [HTTP Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after)
+- [Cloudflare Workers 平台限制](https://developers.cloudflare.com/workers/platform/limits/)
+- [Wrangler 配置推荐](https://developers.cloudflare.com/workers/wrangler/configuration/)
 
----
-
-> 注：本项目仅供学习研究使用，请遵守相关法律法规。
+本项目参考了 [cf-workers-proxy](https://github.com/jonssonyan/cf-workers-proxy) 的实现；仓库原声明采用 GPL-3.0。
