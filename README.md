@@ -30,7 +30,7 @@ npm run deploy
 
 `smoke` 针对 Docker Hub：匿名取 token、读取 busybox 的 linux/amd64 manifest、完整下载 config 和 layer 并校验 SHA-256，检查 HEAD 大小和 Range / 206。它访问真实上游，需要网络并消耗上游请求额度，不运行镜像、不保存 token。部署后将参数替换为 Worker 的 HTTPS 地址再次验证。
 
-GitHub Actions 在 push / PR 时执行安装、检查和依赖审计；部署仍通过已认证的 Wrangler 手动执行。不要仅复制 `src/index.js` 到控制台，它依赖本地模块。此仓库没有 Pages Functions 构建入口，使用 Workers 部署。
+GitHub Actions 在 push / PR 时执行安装、检查和依赖审计。当前仓库还连接了 Cloudflare Workers Builds，推送 main 会触发自动部署；已认证的 Wrangler 可用于手动部署。自动部署与 GitHub CI 是独立流程，推送前应先运行本地检查。不要仅复制 `src/index.js` 到控制台，它依赖本地模块。此仓库没有 Pages Functions 构建入口，使用 Workers 部署。
 
 ## 代理行为
 
