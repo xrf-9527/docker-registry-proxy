@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index.js';
 
 const nativeFetch = globalThis.fetch;
-const env = { MAX_RETRIES: 0, REQUEST_TIMEOUT: 2000, STREAM_IDLE_TIMEOUT: 50 };
+const env = { MAX_RETRIES: 0, REQUEST_TIMEOUT: 2000 };
 const call = (path = '/v2/', overrides = {}, init = {}) =>
 	worker.fetch(new Request('https://proxy.example:8443' + path, init), { ...env, ...overrides });
 const consume = async (response) => {
@@ -232,13 +232,18 @@ describe('redirect and retry bounds', () => {
 });
 
 describe('stream lifetime and backpressure', () => {
-	it('errors and cancels upstream when the body stalls', async () => {
-		const cancel = vi.fn();
-		globalThis.fetch = vi.fn(async () => new Response(new ReadableStream({ cancel })));
+	it('hands the upstream body to the runtime without a JS wrapper', async () => {
+		const body = new ReadableStream({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode('layer'));
+				controller.close();
+			},
+		});
+		globalThis.fetch = vi.fn(async () => new Response(body));
 		const response = await call();
-		await expect(response.text()).rejects.toThrow('Upstream stream idle timeout');
-		expect(cancel).toHaveBeenCalledTimes(1);
-		expect(logSpy.mock.calls.some(([line]) => JSON.parse(line).event === 'stream_timeout')).toBe(true);
+		// A JS pass-through stream bills CPU per chunk and large blobs exceed the limit.
+		expect(response.body).toBe(body);
+		expect(await response.text()).toBe('layer');
 	});
 	it('allows a progressing stream longer than the response-header budget', async () => {
 		let chunk = 0;
@@ -259,27 +264,11 @@ describe('stream lifetime and backpressure', () => {
 		);
 		expect(await (await call('/v2/', { REQUEST_TIMEOUT: 30 })).text()).toBe('aaaa');
 	});
-	it('does not apply the upstream idle timer while the consumer is paused', async () => {
-		globalThis.fetch = vi.fn(async () => new Response('hello'));
-		const response = await call();
-		await new Promise((resolve) => setTimeout(resolve, 80));
-		expect(await response.text()).toBe('hello');
-	});
 	it('propagates downstream cancellation', async () => {
 		const cancel = vi.fn();
 		globalThis.fetch = vi.fn(async () => new Response(new ReadableStream({ cancel })));
 		const response = await call();
 		await response.body.cancel();
-		expect(cancel).toHaveBeenCalledTimes(1);
-	});
-	it('cancels an active stream on client disconnect', async () => {
-		const cancel = vi.fn();
-		const controller = new AbortController();
-		globalThis.fetch = vi.fn(async () => new Response(new ReadableStream({ cancel })));
-		const response = await call('/v2/', {}, { signal: controller.signal });
-		const pending = response.text();
-		controller.abort();
-		await expect(pending).rejects.toThrow('Client disconnected');
 		expect(cancel).toHaveBeenCalledTimes(1);
 	});
 });

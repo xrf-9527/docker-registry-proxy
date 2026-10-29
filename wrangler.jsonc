@@ -12,7 +12,6 @@
 		"PROXY_PROTOCOL": "https",
 		"DEBUG": false,
 		"REQUEST_TIMEOUT": 120000,
-		"STREAM_IDLE_TIMEOUT": 120000,
 		"MAX_RETRIES": 2,
 		// Optional access filters (include /token when restricting Docker Hub paths):
 		// "PATHNAME_REGEX": "^/(v2/|token$)",

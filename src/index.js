@@ -74,7 +74,6 @@ function configuration(env) {
 		filters,
 		maxRetries,
 		timeout: integer(env.REQUEST_TIMEOUT, 120000, 300000),
-		idleTimeout: integer(env.STREAM_IDLE_TIMEOUT, 120000, 300000),
 	};
 }
 
@@ -251,62 +250,6 @@ async function fetchUpstream(request, target, config, logger) {
 	}
 }
 
-// Read one chunk at a time. Only time out while waiting for upstream data, not
-// while downstream backpressure prevents us from reading the next chunk.
-function streamBody(body, idleTimeout, clientSignal, logger) {
-	const reader = body.getReader();
-	let timer;
-	let finished = false;
-	let bytes = 0;
-	let streamController;
-	const finish = (event) => {
-		if (finished) return false;
-		finished = true;
-		clearTimeout(timer);
-		clientSignal.removeEventListener('abort', aborted);
-		logger.log(event, { bytes });
-		return true;
-	};
-	const fail = (error, event) => {
-		if (!finish(event)) return;
-		streamController.error(error);
-		void reader.cancel(error).catch(() => {});
-	};
-	const aborted = () => fail(new ProxyError('Client disconnected', 499), 'stream_cancelled');
-	return new ReadableStream(
-		{
-			start(controller) {
-				streamController = controller;
-				clientSignal.addEventListener('abort', aborted, { once: true });
-				if (clientSignal.aborted) aborted();
-			},
-			async pull(controller) {
-				if (finished) return;
-				timer = setTimeout(() => fail(new ProxyError('Upstream stream idle timeout', 504), 'stream_timeout'), idleTimeout);
-				try {
-					const { done, value } = await reader.read();
-					clearTimeout(timer);
-					if (finished) return;
-					if (done) {
-						finish('stream_complete');
-						controller.close();
-					} else {
-						bytes += value.byteLength;
-						controller.enqueue(value);
-					}
-				} catch (error) {
-					fail(error, 'stream_error');
-				}
-			},
-			cancel(reason) {
-				finish('stream_cancelled');
-				return reader.cancel(reason);
-			},
-		},
-		{ highWaterMark: 0 },
-	);
-}
-
 export default {
 	async fetch(request, env) {
 		const logger = new WorkerLogger(request, env.DEBUG === true || env.DEBUG === 'true');
@@ -337,10 +280,10 @@ export default {
 				await discard(response);
 				return new Response(null, { status: response.status, headers });
 			}
-			return new Response(response.body ? streamBody(response.body, config.idleTimeout, request.signal, logger) : null, {
-				status: response.status,
-				headers,
-			});
+			// Hand the upstream body to the runtime untouched so it is piped natively.
+			// Wrapping it in a JS stream bills CPU per chunk, and large layers hit the
+			// CPU limit mid-transfer; the runtime still cancels upstream on disconnect.
+			return new Response(response.body, { status: response.status, headers });
 		} catch (error) {
 			const status = request.signal.aborted ? 499 : error instanceof ProxyError ? error.status : 502;
 			logger.log('request_error', { status });

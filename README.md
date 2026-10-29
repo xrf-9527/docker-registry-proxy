@@ -39,9 +39,9 @@ GitHub Actions 在 push / PR 时执行安装、检查和依赖审计。当前仓
 - GET / HEAD 的重定向最多跟随 5 次，跨 origin 清除 Authorization；拒绝 HTTPS 降级、非 HTTP(S) URL 和 URL 内嵌凭据。
 - GET / HEAD 遇到网络错误或 408、429、500、502、503、504 时有限重试。优先采用 Retry-After 秒数或 HTTP 日期，否则使用带抖动的指数退避；等待时间超出总预算时直接返回原响应，不提前重试。
 - 写请求原样转发，不重试、不自动跟随重定向。上传仍受 Cloudflare 账户的请求体大小限制；本项目主要验证拉取流程，不宣称完成 Registry 全套一致性认证。
-- 收到最终响应头前共用一个时间预算，包含重试、退避和重定向。之后按每次读取上游数据的空闲时间限时，尊重下游背压，不给正常进行的大镜像下载设置固定总时长上限。
-- 超过响应头预算返回 504，网络错误返回 502，配置错误返回 500，访问拒绝返回 403。已开始发送的流遇到超时会中断，无法再修改已发出的状态码；客户端可重新请求或使用 Range 恢复。
-- 每条丢弃的重定向／重试响应都会取消 body；客户端取消和下载空闲超时也会取消上游读取。
+- 收到最终响应头前共用一个时间预算，包含重试、退避和重定向。之后上游响应体原样交给 Workers 运行时直接转发，不经过 JS 逐块读取，不给大镜像下载设置固定总时长上限。逐块经过 JS 会按数据量消耗 CPU 时间，超过 100MB 左右的层（例如 mysql）会因 CPU 超限在传输中途被切断。
+- 超过响应头预算返回 504，网络错误返回 502，配置错误返回 500，访问拒绝返回 403。已开始发送的流如果中断，无法再修改已发出的状态码；客户端可重新请求或使用 Range 恢复。
+- 每条丢弃的重定向／重试响应都会取消 body；客户端断开时由运行时取消上游读取。
 - 子请求与返回响应显式禁用缓存，不提供镜像缓存加速承诺；这也避免对私有镜像或 token 引入共享缓存。
 
 `ns` 是可选的镜像源提示，本代理使用固定上游：只在 `/v2/` 请求中移除该参数，不根据它选择任意目标。该行为符合 [OCI Registry Proxying](https://github.com/opencontainers/distribution-spec/blob/main/spec.md#registry-proxying)。
@@ -57,7 +57,6 @@ GitHub Actions 在 push / PR 时执行安装、检查和依赖审计。当前仓
 | `PROXY_HOSTNAME`                                    | `registry-1.docker.io` | 单一上游主机，可含端口，不含协议、路径或凭据；旧 `registry.docker.io` 别名会规范化 |
 | `PROXY_PROTOCOL`                                    | `https`                | `https` 或 `http`；HTTP 只用于明确受信的内网上游                                   |
 | `REQUEST_TIMEOUT`                                   | `120000`               | 最终响应头前的总预算，1–300000 毫秒                                                |
-| `STREAM_IDLE_TIMEOUT`                               | `120000`               | 等待上游下一块数据的超时，1–300000 毫秒                                            |
 | `MAX_RETRIES`                                       | `2`                    | GET / HEAD 最多额外尝试次数，0–5；0 禁用重试                                       |
 | `DEBUG`                                             | `false`                | `true` 才输出重试调试日志；状态仅属于当前请求                                      |
 | `PATHNAME_REGEX`                                    | 无                     | 允许的路径正则；代理 Docker Hub 时必须同时允许 `/token`                            |
@@ -106,9 +105,9 @@ docker pull your-ghcr-proxy.example/OWNER/IMAGE:TAG
 
 ## 日志与运维
 
-启用 Workers Observability。应用日志仅记录请求 ID、方法、响应头耗时、状态、上游主机、流完成／中断事件和已读取字节数，不记录 URL 查询、Authorization、Cookie、响应头或上游异常原文。平台自动收集的 invocation 元数据由 Cloudflare 管理。
+启用 Workers Observability。应用日志仅记录请求 ID、方法、响应头耗时、状态和上游主机，不记录 URL 查询、Authorization、Cookie、响应头或上游异常原文。平台自动收集的 invocation 元数据由 Cloudflare 管理。
 
-`response_headers` 只表示拿到响应头；`stream_complete` 才表示应用读完上游。计数是已读取字节，不是对客户端完整收货的证明。请求量、错误率等通过 Cloudflare 的原生指标观察，不提供 `/metrics` 端点。
+`response_headers` 只表示拿到响应头，不代表响应体已完整送达；响应体由运行时转发，应用不再记录流完成事件。传输是否被平台中断看 invocation 的 `outcome`（如 `exceededCpu`）。请求量、错误率等通过 Cloudflare 的原生指标观察，不提供 `/metrics` 端点。
 
 访问控制默认未启用。自用部署应配置合适的过滤规则；生产下载中断或限流问题需要结合实际 Workers 日志与 Docker 输出诊断。
 
