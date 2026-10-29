@@ -14,10 +14,10 @@
 		"smoke": "node scripts/smoke.mjs"
 	},
 	"devDependencies": {
-		"@cloudflare/vitest-plugin": "1.1.7",
-		"vitest": "4.1.11",
-		"wrangler": "4.131.0",
-		"prettier": "3.9.6"
+		"@cloudflare/vitest-plugin": "1.4.10",
+		"prettier": "3.9.10",
+		"vitest": "4.1.12",
+		"wrangler": "4.155.0"
 	},
 	"type": "module",
 	"engines": {
